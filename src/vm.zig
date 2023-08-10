@@ -56,7 +56,8 @@ const Trap = error{
     InvalidInstruction,
     InvalidAddress,
     StackOverflow,
-    SelfModify, // Only emitted if config.self_modification is disabled
+    CodeSegmentModified, // Only emitted if config.self_modification is disabled
+    JumpToDataSegment, // Only emitted if config.self_modification is disabled
 } || std.fs.File.WriteError;
 
 fn interpret(ctx: InterpreterContext) Trap!void {
@@ -122,7 +123,7 @@ pub const InterpreterContext = struct {
 
     pub inline fn jump(ctx: InterpreterContext, addr: u12) !void {
         if (!ctx.config.self_modification and addr >= Env.memory_base + ctx.env.program_size) {
-            return error.SelfModify;
+            return error.JumpToDataSegment;
         }
         ctx.env.pc = addr;
     }
@@ -207,7 +208,12 @@ const Env = struct {
     pub inline fn setMemNoSelfModify(env: *Env, addr: u16, values: []const u8) !void {
         const begin = try addrOffset(addr);
         const end = try addrOffset(addr + @as(u4, @intCast(values.len)));
-        if (begin < env.program_size) return error.SelfModify;
+        if (begin < env.program_size) {
+            std.log.err("Attempted write to address 0x{x:0>4}, within code segment (ends 0x{x:0>4})", .{
+                begin, env.program_size,
+            });
+            return error.CodeSegmentModified;
+        }
         @memcpy(env.memory[begin..end], values);
     }
 

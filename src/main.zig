@@ -53,3 +53,19 @@ const term_setup =
 const term_teardown =
     "\x1b[?25h" ++ // Show cursor
     "\x1b[?1049l"; // Switch to main buffer
+
+pub const std_options = struct {
+    pub fn logFn(
+        comptime level: std.log.Level,
+        comptime scope: @Type(.EnumLiteral),
+        comptime format: []const u8,
+        args: anytype,
+    ) void {
+        // Switch to main buffer
+        std.debug.print("\x1b[?1049l", .{});
+        // Print log message
+        std.log.defaultLog(level, scope, format, args);
+        // Switch back to alt buffer
+        std.debug.print("\x1b[?1049l", .{});
+    }
+};
