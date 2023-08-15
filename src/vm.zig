@@ -37,11 +37,12 @@ pub fn exec(config: Config, prog: []const u8) !void {
     @memcpy(env.memory[Env.memory_base..][0..prog.len], prog);
 
     if (config.jit) {
-        const result = try copy_patch.compile(config, prog);
         var ctx = CopyPatchContext{
             .env = env,
-            .program_map = result.program_map,
+            .config = &config,
         };
+        // TODO: free compiled blocks
+        _ = try copy_patch.compileBlock(&ctx, Env.memory_base);
         const entry = ctx.program_map[0] orelse {
             return error.NoEntryPoint; // How even?
         };
@@ -72,6 +73,7 @@ pub const Trap = error{
     Exit,
     InvalidAddress,
     UnsupportedInstruction,
+    CompileError,
     StackOverflow,
     CodeSegmentModified, // Only emitted if config.self_modification is disabled
     JumpToDataSegment, // Only emitted if config.self_modification is disabled
@@ -166,10 +168,11 @@ pub const CopyPatchContext = struct {
     /// Trap value - used to determine whether we're unwinding, and why
     trap: copy_patch.Trap = .success,
     /// Instruction address map
-    program_map: [program_map_len]?*const fn (*CopyPatchContext) callconv(.C) void,
+    program_map: [program_map_len]?*const fn (*CopyPatchContext) callconv(.C) void = .{null} ** program_map_len,
+
+    config: *const Config,
 
     pub const program_map_len = Env.memory_len - Env.memory_base;
-    pub const ProgramMap = [program_map_len]?*const fn (*CopyPatchContext) callconv(.C) void;
 
     pub inline fn getMem(ctx: *CopyPatchContext, addr: u16, count: u4) ![]const u8 {
         return ctx.env.getMem(addr, count);
@@ -188,7 +191,7 @@ pub const CopyPatchContext = struct {
     }
     pub inline fn call(ctx: *CopyPatchContext, addr: u12) !void {
         // TODO: stack overflow checking
-        const compiled_addr = ctx.program_map[addr - Env.memory_base] orelse return error.InvalidAddress;
+        const compiled_addr = try ctx.compiledAddr(addr);
         compiled_addr(ctx);
 
         // Are we unwinding?
@@ -202,7 +205,7 @@ pub const CopyPatchContext = struct {
             linked(.log_invalid_jump, .{addr});
             return error.InvalidAddress;
         }
-        const compiled_addr = ctx.program_map[addr - Env.memory_base] orelse return error.JumpToDataSegment;
+        const compiled_addr = try ctx.compiledAddr(addr);
         @call(.always_tail, compiled_addr, .{ctx});
     }
     pub inline fn skip(ctx: *CopyPatchContext) !void {
@@ -212,11 +215,22 @@ pub const CopyPatchContext = struct {
 
     pub inline fn blitScreen(ctx: *CopyPatchContext) !void {
         const err = linked(.blitScreen, .{&ctx.env});
-        return copy_patch.Trap.toErrorUnion(err);
+        return err.toErrorUnion();
     }
 
     pub inline fn readTimer(ctx: *CopyPatchContext) u64 {
         return linked(.readTimer, .{&ctx.env});
+    }
+
+    inline fn compiledAddr(ctx: *CopyPatchContext, addr: u12) !copy_patch.InsnFn {
+        const offset = addr - Env.memory_base;
+        if (ctx.program_map[offset]) |compiled| {
+            return compiled;
+        } else {
+            const err = linked(.compileBlock, .{ ctx, addr });
+            try err.toErrorUnion();
+            return ctx.program_map[offset].?;
+        }
     }
 
     inline fn linked(
@@ -246,12 +260,24 @@ pub const CopyPatchContext = struct {
         pub fn readTimer(env: *Env) callconv(.C) u64 {
             return env.timer.read();
         }
+
+        pub fn compileBlock(ctx: *CopyPatchContext, addr: u16) callconv(.C) copy_patch.Trap {
+            // TODO: free compiled blocks
+            _ = copy_patch.compileBlock(ctx, @intCast(addr)) catch |err| {
+                std.log.err("Compile error in block at {}: {s}", .{ addr, @errorName(err) });
+                if (@errorReturnTrace()) |trace| {
+                    std.debug.dumpStackTrace(trace.*);
+                }
+                return copy_patch.Trap.CompileError;
+            };
+            return .success;
+        }
     };
-    extern const extern_link_table: @TypeOf(link_table);
+    extern const extern_link_table: LinkTable;
+    pub const LinkTable = [@typeInfo(linkable).Struct.decls.len]*const anyopaque;
     pub const link_table = a: {
-        const funcs = std.enums.values(std.meta.DeclEnum(linkable));
-        var ptrs: [funcs.len]*const anyopaque = undefined;
-        for (funcs) |func| {
+        var ptrs: LinkTable = undefined;
+        for (std.enums.values(std.meta.DeclEnum(linkable))) |func| {
             ptrs[@intFromEnum(func)] = @ptrCast(&@field(linkable, @tagName(func)));
         }
         break :a ptrs;

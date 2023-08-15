@@ -11,6 +11,7 @@ pub const Trap = enum(u8) {
     Exit,
     InvalidAddress,
     UnsupportedInstruction,
+    CompileError,
     StackOverflow,
     CodeSegmentModified,
     JumpToDataSegment,
@@ -42,30 +43,63 @@ pub const Trap = enum(u8) {
     }
 };
 
-pub fn compile(config: vm.Config, prog: []const u8) vm.CompileError!CompileResult {
-    std.debug.assert(!config.self_modification);
+pub fn compileBlock(ctx: *vm.CopyPatchContext, addr: u12) vm.CompileError!CompileResult {
+    std.debug.assert(!ctx.config.self_modification);
 
-    const result = try assembleProgram(prog);
-    try linkProgram(prog, result);
+    std.log.debug("compiling block at {}", .{addr});
+    const result = try assembleBlock(ctx, addr);
+    std.log.debug("finished assembly", .{});
+    try linkBlock(ctx, addr, result.end, result.code);
+    std.log.debug("finished linking", .{});
+
     try std.os.mprotect(
-        result.compiled_code.ptr[0..std.mem.alignForward(
+        result.code.ptr[0..std.mem.alignForward(
             usize,
-            result.compiled_code.len,
+            result.code.len,
             std.mem.page_size,
         )],
         std.os.PROT.READ | std.os.PROT.EXEC,
     );
-    return result;
+
+    std.log.debug("compile successful", .{});
+    return .{ .compiled_code = result.code };
 }
 
-fn assembleProgram(prog: []const u8) !CompileResult {
-    // Compute assembled program length
+fn assembleBlock(ctx: *vm.CopyPatchContext, addr: u12) !AssembleResult {
+    // Compute assembled length
     var size: usize = 0;
-    var it: instructions.InsnIter = .{ .prog = prog };
+    var just_skipped = false;
+    var it: instructions.InsnIter = .{
+        .prog = &ctx.env.memory,
+        .offset = addr,
+    };
     while (try it.next()) |match| {
+        std.log.debug("counting {} {}", .{ it.offset - 2, match });
         const template = templates.templates[@intFromEnum(match)];
         size = std.mem.alignForward(usize, size + template.len, @alignOf(usize)) + immediates(match).size;
+
+        switch (match) {
+            .se_reg_imm,
+            .se_reg_reg,
+            .sne_reg_imm,
+            .sne_reg_reg,
+            .skp,
+            .sknp,
+            => just_skipped = true,
+
+            // If we hit a jump or return and there's no way to skip over it, that's the end of the block
+            // FIXME: theoretically, a skip could be pointless and never actually jump, meaning the code after it could be
+            //        invalid, so we should probably handle that too. But that seems unlikely so let's ignore it! :)
+            .jp_imm, .jp_reg0_off, .ret => if (just_skipped) {
+                just_skipped = false;
+            } else {
+                break;
+            },
+
+            else => just_skipped = false,
+        }
     }
+    const end = it.offset;
     // Allocate extra space for the link table reference
     size = std.mem.alignForward(usize, size, @alignOf(usize)) + @sizeOf(usize);
 
@@ -79,12 +113,13 @@ fn assembleProgram(prog: []const u8) !CompileResult {
         0,
     );
 
-    // Assemble program from opcode templates, and generate program map
-    var map: vm.CopyPatchContext.ProgramMap = .{null} ** vm.CopyPatchContext.program_map_len;
+    // Assemble program from opcode templates, and update program map
     var offset: usize = 0;
-    it = instructions.InsnIter{ .prog = prog };
-    while (try it.next()) |match| {
-        map[it.offset - 2] = @ptrCast(&code[offset]);
+    it.offset = addr; // Reset iterator
+    while (it.offset < end) {
+        const match = (try it.next()).?;
+        std.log.debug("assembling {} {}", .{ it.offset - 2, match });
+        ctx.program_map[it.offset - 2 - vm.Env.memory_base] = @ptrCast(&code[offset]);
 
         const template = templates.templates[@intFromEnum(match)];
         @memcpy(code[offset .. offset + template.len], template.code());
@@ -106,14 +141,11 @@ fn assembleProgram(prog: []const u8) !CompileResult {
     offset = std.mem.alignForward(usize, offset, @alignOf(usize));
     std.debug.assert(offset + @sizeOf(usize) == code.len);
     std.mem.bytesAsValue(
-        *const @TypeOf(vm.CopyPatchContext.link_table),
+        *const vm.CopyPatchContext.LinkTable,
         code[offset..][0..@sizeOf(usize)],
     ).* = &vm.CopyPatchContext.link_table;
 
-    return .{
-        .compiled_code = code,
-        .program_map = map,
-    };
+    return .{ .code = code, .end = end };
 }
 
 fn immediates(match: instructions.Match) Immediates {
@@ -140,10 +172,15 @@ const Immediates = struct {
     values: [3]u16 = undefined,
 };
 
-fn linkProgram(prog: []const u8, result: CompileResult) !void {
-    var it: instructions.InsnIter = .{ .prog = prog };
+fn linkBlock(ctx: *vm.CopyPatchContext, addr: u12, end: usize, code: []align(std.mem.page_size) u8) !void {
+    var it: instructions.InsnIter = .{
+        .prog = &ctx.env.memory,
+        .offset = addr,
+    };
     var offset: usize = 0;
-    while (try it.next()) |match| {
+    while (it.offset < end) {
+        const match = (try it.next()).?;
+        std.log.debug("linking {} {}", .{ it.offset - 2, match });
         const template = templates.templates[@intFromEnum(match)];
         const imm_offset = std.mem.alignForward(usize, offset + template.len, @sizeOf(usize));
         defer offset = imm_offset + immediates(match).size;
@@ -151,13 +188,13 @@ fn linkProgram(prog: []const u8, result: CompileResult) !void {
         var reloc_map = RelocationMap{
             .operands = @alignCast(std.mem.bytesAsValue(
                 usize,
-                result.compiled_code[imm_offset..][0..@sizeOf(usize)],
+                code[imm_offset..][0..@sizeOf(usize)],
             )),
 
-            .next_instruction = result.program_map[it.offset],
-            .next_next_instruction = result.program_map[it.offset + 2],
+            .next_instruction = ctx.program_map[it.offset - vm.Env.memory_base],
+            .next_next_instruction = ctx.program_map[it.offset + 2 - vm.Env.memory_base],
 
-            .extern_link_table = @alignCast(@ptrCast(&result.compiled_code[result.compiled_code.len - @sizeOf(usize)])),
+            .extern_link_table = @alignCast(@ptrCast(&code[code.len - @sizeOf(usize)])),
         };
 
         const relocs = template.relocations();
@@ -170,6 +207,10 @@ fn linkProgram(prog: []const u8, result: CompileResult) !void {
                         // Depending on context, this could mean one of:
                         // - a "skip" instruction is used too close to the end of the program
                         // - the code ends with a non-jump, non-ret instruction
+                        std.log.err("Relocation for {s} in {s} instruction has no value", .{
+                            @tagName(sym),
+                            @tagName(match),
+                        });
                         return error.InvalidInstruction;
                     };
 
@@ -177,11 +218,11 @@ fn linkProgram(prog: []const u8, result: CompileResult) !void {
                 },
             };
 
-            const addr = @intFromPtr(result.compiled_code.ptr) + offset + rel.offset;
-            const value: i32 = @intCast(@as(i65, symbol_value) - addr + rel.addend);
+            const reloc_addr = @intFromPtr(code.ptr) + offset + rel.offset;
+            const value: i32 = @intCast(@as(i65, symbol_value) - reloc_addr + rel.addend);
             std.mem.writeIntNative(
                 u32,
-                result.compiled_code[offset + rel.offset ..][0..@sizeOf(u32)],
+                code[offset + rel.offset ..][0..@sizeOf(u32)],
                 @as(u32, @bitCast(value)),
             );
         }
@@ -190,11 +231,15 @@ fn linkProgram(prog: []const u8, result: CompileResult) !void {
 
 pub const CompileResult = struct {
     compiled_code: []align(std.mem.page_size) u8,
-    program_map: vm.CopyPatchContext.ProgramMap,
 
     pub fn deinit(result: CompileResult) void {
         std.os.munmap(result.compiled_code);
     }
+};
+
+const AssembleResult = struct {
+    code: []align(std.mem.page_size) u8,
+    end: usize,
 };
 
 const RelocationMap = struct {
@@ -203,7 +248,7 @@ const RelocationMap = struct {
     next_instruction: ?InsnFn,
     next_next_instruction: ?InsnFn,
 
-    extern_link_table: ?*const *const @TypeOf(vm.CopyPatchContext.link_table),
+    extern_link_table: ?*const *const vm.CopyPatchContext.LinkTable,
 };
 
-const InsnFn = *const fn (*vm.CopyPatchContext) callconv(.C) void;
+pub const InsnFn = *const fn (*vm.CopyPatchContext) callconv(.C) void;

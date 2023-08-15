@@ -43,18 +43,31 @@ pub fn main() !void {
 }
 
 fn disassemble(prog: []const u8) !void {
+    var out = std.io.getStdOut().writer();
     var it: instructions.InsnIter = .{ .prog = prog };
-    while (try it.next()) |match| {
-        std.debug.print("{d: >4}: {s}", .{ it.offset - 2 + vm.Env.memory_base, @tagName(match) });
+    while (it.offset < prog.len) {
+        try out.print("{: >4}: {x:0>2} {x:0>2}  ", .{
+            it.offset + vm.Env.memory_base,
+            prog[it.offset],
+            prog[it.offset + 1],
+        });
+
+        const match = (it.next() catch {
+            try out.writeAll(" invalid\n");
+            it.offset += 2;
+            continue;
+        }).?;
+
+        try out.print("{s}", .{@tagName(match)});
         switch (match) {
             inline else => |operands| inline for (operands) |operand| {
                 switch (@TypeOf(operand)) {
-                    vm.Register => std.debug.print(" {s}", .{@tagName(operand)}),
-                    else => std.debug.print(" {}", .{operand}),
+                    vm.Register => try out.print(" {s}", .{@tagName(operand)}),
+                    else => try out.print(" {}", .{operand}),
                 }
             },
         }
-        std.debug.print("\n", .{});
+        try out.writeAll("\n");
     }
 }
 
@@ -92,10 +105,10 @@ pub const std_options = struct {
         args: anytype,
     ) void {
         // Switch to main buffer
-        std.debug.print("\x1b[?1049l", .{});
+        std.io.getStdOut().writeAll("\x1b[?1049l") catch {};
         // Print log message
         std.log.defaultLog(level, scope, format, args);
         // Switch back to alt buffer
-        std.debug.print("\x1b[?1049l", .{});
+        std.io.getStdOut().writeAll("\x1b[?1049h\x1b[97;40m") catch {};
     }
 };

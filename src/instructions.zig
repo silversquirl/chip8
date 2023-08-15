@@ -54,7 +54,7 @@ pub const InsnIter = struct {
     prog: []const u8,
     offset: usize = 0,
 
-    pub fn next(it: *InsnIter) !?Match {
+    pub fn next(it: *InsnIter) error{InvalidInstruction}!?Match {
         if (it.offset >= it.prog.len) return null;
         const opcode = std.mem.readIntBig(u16, it.prog[it.offset..][0..2]);
         const match = try decode(opcode);
