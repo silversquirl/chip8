@@ -1,24 +1,32 @@
 const std = @import("std");
+const instructions = @import("instructions.zig");
 const vm = @import("vm.zig");
 
-var saved_termios: std.os.termios = undefined;
+const Mode = enum {
+    interp,
+    jit,
+    disas,
+};
 
 pub fn main() !void {
     var args = try std.process.argsWithAllocator(std.heap.page_allocator);
     std.debug.assert(args.skip());
     const rom_path = args.next() orelse return error.NotEnoughArgs;
+    const mode = if (args.next()) |mode|
+        std.meta.stringToEnum(Mode, mode) orelse @panic("Invalid mode")
+    else
+        .interp;
 
     var rom_buf: [4096]u8 = undefined;
     const rom = try std.fs.cwd().readFile(rom_path, &rom_buf);
 
-    saved_termios = try std.os.tcgetattr(std.os.STDIN_FILENO);
-    var new_termios = saved_termios;
-    // Disable echo and canonical mode
-    new_termios.lflag &= ~(std.os.system.ECHO | std.os.system.ICANON);
-    try std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, new_termios);
-    defer teardown();
+    if (mode == .disas) {
+        try disassemble(rom);
+        return;
+    }
 
     try std.io.getStdOut().writeAll(term_setup);
+    defer teardown();
 
     const act: std.os.Sigaction = .{
         .handler = .{ .handler = catchSignal },
@@ -28,17 +36,39 @@ pub fn main() !void {
     try std.os.sigaction(std.os.SIG.INT, &act, null);
     try std.os.sigaction(std.os.SIG.HUP, &act, null);
     try std.os.sigaction(std.os.SIG.TERM, &act, null);
+    try std.os.sigaction(std.os.SIG.TRAP, &act, null);
+    try std.os.sigaction(std.os.SIG.SEGV, &act, null);
 
-    try vm.exec(.{}, rom);
+    try vm.exec(.{ .jit = mode == .jit }, rom);
 }
 
-fn catchSignal(_: c_int) callconv(.C) void {
+fn disassemble(prog: []const u8) !void {
+    var it: instructions.InsnIter = .{ .prog = prog };
+    while (try it.next()) |match| {
+        std.debug.print("{d: >4}: {s}", .{ it.offset - 2 + vm.Env.memory_base, @tagName(match) });
+        switch (match) {
+            inline else => |operands| inline for (operands) |operand| {
+                switch (@TypeOf(operand)) {
+                    vm.Register => std.debug.print(" {s}", .{@tagName(operand)}),
+                    else => std.debug.print(" {}", .{operand}),
+                }
+            },
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+fn catchSignal(sig: c_int) callconv(.C) void {
     teardown();
-    std.os.exit(0);
+    std.os.exit(@intCast(128 + sig));
 }
 fn teardown() void {
-    std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, saved_termios) catch {};
     std.io.getStdOut().writeAll(term_teardown) catch {};
+}
+
+pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+    teardown();
+    std.builtin.default_panic(msg, error_return_trace, ret_addr orelse @returnAddress());
 }
 
 const term_setup =

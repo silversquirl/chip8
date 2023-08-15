@@ -50,6 +50,19 @@ pub const Match = a: {
     } });
 };
 
+pub const InsnIter = struct {
+    prog: []const u8,
+    offset: usize = 0,
+
+    pub fn next(it: *InsnIter) !?Match {
+        if (it.offset >= it.prog.len) return null;
+        const opcode = std.mem.readIntBig(u16, it.prog[it.offset..][0..2]);
+        const match = try decode(opcode);
+        it.offset += 2;
+        return match;
+    }
+};
+
 fn pattern(desc: *const [4]u8) Pattern {
     var pat = Pattern{};
     for (desc) |c| {
@@ -131,7 +144,7 @@ fn Operands(comptime pat: Pattern) type {
     return std.meta.Tuple(&types);
 }
 
-const Opcode = std.meta.DeclEnum(insns);
+pub const Opcode = std.meta.DeclEnum(insns);
 const Table = std.enums.EnumFieldStruct(Opcode, *const [4]u8, null);
 const table = Table{
     .cls = "00E0",
@@ -171,20 +184,26 @@ const table = Table{
     .ld_reg_mem = "Fx65",
 };
 
-const Context = vm.InterpreterContext;
+const Context = std.meta.globalOption("InstructionContext", type) orelse vm.InterpreterContext;
 pub const insns = struct {
     // Graphics
     pub fn cls(ctx: Context) !void {
         // Clear screen buffer
-        @memset(std.mem.asBytes(&ctx.env.screen), 0);
+        // @memset(std.mem.asBytes(&ctx.env.screen), 0);
+        for (&ctx.env.screen) |*row| {
+            for (row) |*px| {
+                px.* = 0;
+            }
+        }
         // Blit
-        try ctx.env.blitScreen();
+        try ctx.blitScreen();
     }
     pub fn drw(ctx: Context, x: vm.Register, y: vm.Register, n: u4) !void {
         const xv = ctx.env.getReg(x);
         const yv = ctx.env.getReg(y);
 
         // Update screen buffer
+        // TODO: consider moving this logic to a context function
         var collide = false;
         const sprite = try ctx.getMem(ctx.env.addr, n);
         for (sprite, 0..) |row, yoff| {
@@ -202,45 +221,39 @@ pub const insns = struct {
 
         // Re-blit the whole screen
         // TODO: damage tracking
-        try ctx.env.blitScreen();
+        try ctx.blitScreen();
     }
     pub fn ld_i_sprite(ctx: Context, x: vm.Register) !void {
-        const digit: u4 = @truncate(ctx.env.getReg(x));
+        const digit = ctx.env.getReg(x) & 0xf;
         ctx.env.addr = 0x0000 + 5 * digit;
     }
 
     // Keyboard
-    pub fn skp(ctx: Context, x: vm.Register) !void {
-        _ = ctx;
-        _ = x;
-        std.debug.print("skp\n", .{});
+    pub fn skp(_: Context, _: vm.Register) !void {
+        return error.UnsupportedInstruction;
     }
-    pub fn sknp(ctx: Context, x: vm.Register) !void {
-        _ = ctx;
-        _ = x;
-        std.debug.print("sknp\n", .{});
+    pub fn sknp(_: Context, _: vm.Register) !void {
+        return error.UnsupportedInstruction;
     }
-    pub fn ld_reg_key(ctx: Context, x: vm.Register) !void {
-        _ = ctx;
-        _ = x;
-        std.debug.print("ld_reg_key\n", .{});
+    pub fn ld_reg_key(_: Context, _: vm.Register) !void {
+        return error.UnsupportedInstruction;
     }
 
     // Timers
     pub fn ld_reg_dt(ctx: Context, x: vm.Register) !void {
         const old_t = ctx.env.dt.t;
-        const new_t = ctx.env.timer.read();
+        const new_t = ctx.readTimer();
         const diff = new_t - old_t;
         ctx.env.dt.t = new_t + diff % 60;
         ctx.env.dt.d = @intCast(ctx.env.dt.d -| diff / 60);
         ctx.env.setReg(x, ctx.env.dt.d);
     }
     pub fn ld_dt_reg(ctx: Context, x: vm.Register) !void {
-        ctx.env.dt.t = ctx.env.timer.read();
+        ctx.env.dt.t = ctx.readTimer();
         ctx.env.dt.d = ctx.env.getReg(x);
     }
     pub fn ld_st_reg(ctx: Context, x: vm.Register) !void {
-        ctx.env.st.t = ctx.env.timer.read();
+        ctx.env.st.t = ctx.readTimer();
         ctx.env.st.d = ctx.env.getReg(x);
     }
 
@@ -253,6 +266,7 @@ pub const insns = struct {
     }
 
     pub fn jp_imm(ctx: Context, addr: u12) !void {
+        // TODO(JIT): inline constant
         try ctx.jump(addr);
     }
     pub fn jp_reg0_off(ctx: Context, off: u12) !void {
@@ -262,22 +276,22 @@ pub const insns = struct {
 
     pub fn se_reg_imm(ctx: Context, x: vm.Register, n: u8) !void {
         if (ctx.env.getReg(x) == n) {
-            try ctx.jumpRel(2);
+            try ctx.skip();
         }
     }
     pub fn se_reg_reg(ctx: Context, x: vm.Register, y: vm.Register) !void {
         if (ctx.env.getReg(x) == ctx.env.getReg(y)) {
-            try ctx.jumpRel(2);
+            try ctx.skip();
         }
     }
     pub fn sne_reg_imm(ctx: Context, x: vm.Register, n: u8) !void {
         if (ctx.env.getReg(x) != n) {
-            try ctx.jumpRel(2);
+            try ctx.skip();
         }
     }
     pub fn sne_reg_reg(ctx: Context, x: vm.Register, y: vm.Register) !void {
         if (ctx.env.getReg(x) != ctx.env.getReg(y)) {
-            try ctx.jumpRel(2);
+            try ctx.skip();
         }
     }
 
@@ -298,7 +312,7 @@ pub const insns = struct {
     pub fn ld_reg_mem(ctx: Context, x: vm.Register) !void {
         const xn = @intFromEnum(x) + 1;
         const mem = try ctx.getMem(ctx.env.addr, xn);
-        @memcpy(ctx.env.regs[0..xn], mem);
+        for (ctx.env.regs[0..xn], mem) |*d, s| d.* = s;
     }
 
     // Arithmetic

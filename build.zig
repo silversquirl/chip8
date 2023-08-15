@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe.addModule("copy_patch_templates", copyPatchTemplates(b, target));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -28,4 +29,26 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+fn copyPatchTemplates(b: *std.Build, target: std.zig.CrossTarget) *std.Build.Module {
+    const stub = b.addObject(.{
+        .name = "copy_patch_stub",
+        .root_source_file = .{ .path = "src/copy_patch_stub.zig" },
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+    stub.force_pic = true;
+
+    const gen = b.addExecutable(.{
+        .name = "copy_patch_gen",
+        .root_source_file = .{ .path = "build/copy_patch_gen.zig" },
+    });
+
+    const run = b.addRunArtifact(gen);
+    run.addArtifactArg(stub);
+    _ = run.addOutputFileArg("templates.bin");
+    return b.createModule(.{
+        .source_file = run.addOutputFileArg("templates.zig"),
+    });
 }

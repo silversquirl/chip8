@@ -1,5 +1,6 @@
 //! CHIP-8 interpreter + VM
 const std = @import("std");
+const copy_patch = @import("copy_patch.zig");
 const instructions = @import("instructions.zig");
 
 pub const Register = enum(u4) {
@@ -22,14 +23,11 @@ pub const Register = enum(u4) {
 };
 
 pub fn exec(config: Config, prog: []const u8) !void {
-    std.debug.assert(!config.jit);
-
     var seed: u64 = undefined;
     try std.os.getrandom(std.mem.asBytes(&seed));
     var rng = std.rand.DefaultPrng.init(0);
 
     var env = Env{
-        .program_map = undefined,
         .program_size = @intCast(prog.len),
 
         .rng = rng.random(),
@@ -38,11 +36,26 @@ pub fn exec(config: Config, prog: []const u8) !void {
     };
     @memcpy(env.memory[Env.memory_base..][0..prog.len], prog);
 
-    var ctx = InterpreterContext{
-        .env = &env,
-        .config = &config,
-    };
+    if (config.jit) {
+        const result = try copy_patch.compile(config, prog);
+        var ctx = CopyPatchContext{
+            .env = env,
+            .program_map = result.program_map,
+        };
+        const entry = ctx.program_map[0] orelse {
+            return error.NoEntryPoint; // How even?
+        };
+        entry(&ctx);
+        try ctx.trap.toErrorUnion();
+    } else {
+        try execInterp(.{
+            .env = &env,
+            .config = &config,
+        });
+    }
+}
 
+fn execInterp(ctx: InterpreterContext) !void {
     while (interpret(ctx)) |_| {
         //
     } else |err| switch (err) {
@@ -51,16 +64,21 @@ pub fn exec(config: Config, prog: []const u8) !void {
     }
 }
 
-const Trap = error{
-    Exit,
+pub const CompileError = error{
     InvalidInstruction,
+} || std.os.MMapError || std.os.MProtectError;
+
+pub const Trap = error{
+    Exit,
     InvalidAddress,
+    UnsupportedInstruction,
     StackOverflow,
     CodeSegmentModified, // Only emitted if config.self_modification is disabled
     JumpToDataSegment, // Only emitted if config.self_modification is disabled
-} || std.fs.File.WriteError;
+    InputOutput,
+};
 
-fn interpret(ctx: InterpreterContext) Trap!void {
+fn interpret(ctx: InterpreterContext) (Trap || CompileError)!void {
     const opcode_bytes = try ctx.getMem(ctx.env.pc, 2);
     ctx.env.pc += 2;
 
@@ -127,12 +145,117 @@ pub const InterpreterContext = struct {
         }
         ctx.env.pc = addr;
     }
-    pub inline fn jumpRel(ctx: InterpreterContext, off: u12) !void {
-        const addr = std.math.add(u12, ctx.env.pc, off) catch {
+    pub inline fn skip(ctx: InterpreterContext) !void {
+        const addr = std.math.add(u12, ctx.env.pc, 2) catch {
             return error.InvalidAddress;
         };
         try ctx.jump(addr);
     }
+
+    pub inline fn blitScreen(ctx: InterpreterContext) !void {
+        return ctx.env.blitScreen();
+    }
+
+    pub inline fn readTimer(ctx: InterpreterContext) u64 {
+        return ctx.env.timer.read();
+    }
+};
+
+pub const CopyPatchContext = struct {
+    env: Env,
+    /// Trap value - used to determine whether we're unwinding, and why
+    trap: copy_patch.Trap = .success,
+    /// Instruction address map
+    program_map: [program_map_len]?*const fn (*CopyPatchContext) callconv(.C) void,
+
+    pub const program_map_len = Env.memory_len - Env.memory_base;
+    pub const ProgramMap = [program_map_len]?*const fn (*CopyPatchContext) callconv(.C) void;
+
+    pub inline fn getMem(ctx: *CopyPatchContext, addr: u16, count: u4) ![]const u8 {
+        return ctx.env.getMem(addr, count);
+    }
+    pub inline fn setMem(ctx: *CopyPatchContext, addr: u16, values: []const u8) !void {
+        const begin = try Env.addrOffset(addr);
+        if (begin < ctx.env.program_size) {
+            linked(.log_code_seg_modified, .{ begin, ctx.env.program_size });
+            return error.CodeSegmentModified;
+        }
+        return ctx.env.setMem(addr, values);
+    }
+
+    pub inline fn ret(_: InterpreterContext) !void {
+        @compileError("ret should be implemented in copy_patch_stub.zig");
+    }
+    pub inline fn call(ctx: *CopyPatchContext, addr: u12) !void {
+        // TODO: stack overflow checking
+        const compiled_addr = ctx.program_map[addr - Env.memory_base] orelse return error.InvalidAddress;
+        compiled_addr(ctx);
+
+        // Are we unwinding?
+        if (ctx.trap != .success) {
+            return error.Unwind;
+        }
+    }
+
+    pub inline fn jump(ctx: *CopyPatchContext, addr: u12) !void {
+        if (addr < Env.memory_base or addr >= Env.memory_len) {
+            linked(.log_invalid_jump, .{addr});
+            return error.InvalidAddress;
+        }
+        const compiled_addr = ctx.program_map[addr - Env.memory_base] orelse return error.JumpToDataSegment;
+        @call(.always_tail, compiled_addr, .{ctx});
+    }
+    pub inline fn skip(ctx: *CopyPatchContext) !void {
+        @call(.always_tail, next_next_instruction, .{ctx});
+    }
+    extern fn next_next_instruction(*CopyPatchContext) void;
+
+    pub inline fn blitScreen(ctx: *CopyPatchContext) !void {
+        const err = linked(.blitScreen, .{&ctx.env});
+        return copy_patch.Trap.toErrorUnion(err);
+    }
+
+    pub inline fn readTimer(ctx: *CopyPatchContext) u64 {
+        return linked(.readTimer, .{&ctx.env});
+    }
+
+    inline fn linked(
+        comptime func: std.meta.DeclEnum(linkable),
+        args: anytype,
+    ) @typeInfo(@TypeOf(@field(linkable, @tagName(func)))).Fn.return_type.? {
+        const Fn = @TypeOf(@field(linkable, @tagName(func)));
+        if (@typeInfo(Fn).Fn.calling_convention != .C) {
+            @compileError("Expected function with C calling convention, got " ++ @typeName(Fn));
+        }
+        const f: *const Fn = @ptrCast(extern_link_table[@intFromEnum(func)]);
+        return @call(.auto, f, args);
+    }
+
+    const linkable = struct {
+        pub fn log_code_seg_modified(begin: u16, size: u16) callconv(.C) void {
+            std.log.err("Attempted write to address 0x{x:0>4}, within code segment (ends 0x{x:0>4})", .{ begin, size });
+        }
+
+        pub fn log_invalid_jump(addr: u16) callconv(.C) void {
+            std.log.err("Jump to invalid address 0x{x}", .{addr});
+        }
+
+        pub fn blitScreen(env: *Env) callconv(.C) copy_patch.Trap {
+            return copy_patch.Trap.fromErrorUnion(env.blitScreen());
+        }
+        pub fn readTimer(env: *Env) callconv(.C) u64 {
+            return env.timer.read();
+        }
+    };
+    extern const extern_link_table: @TypeOf(link_table);
+    pub const link_table = a: {
+        const funcs = std.enums.values(std.meta.DeclEnum(linkable));
+        var ptrs: [funcs.len]*const anyopaque = undefined;
+        for (funcs) |func| {
+            ptrs[@intFromEnum(func)] = @ptrCast(&@field(linkable, @tagName(func)));
+        }
+        break :a ptrs;
+    };
 };
 
 // boot image for the "interpreter" region of memory
@@ -157,9 +280,9 @@ const interp_image = [_]u8{
 };
 
 /// The environment contains all runtime data used by a CHIP-8 program
-const Env = struct {
+pub const Env = struct {
     /// Memory buffer
-    memory: [4096]u8 = interp_image ++ .{0} ** (4096 - interp_image.len),
+    memory: [memory_len]u8 = interp_image ++ .{0} ** (memory_len - interp_image.len),
 
     /// 8-bit general purpose registers
     regs: [16]u8 = .{0} ** 16,
@@ -174,8 +297,6 @@ const Env = struct {
     /// Program counter
     pc: u12 = memory_base,
 
-    /// Instruction address map (only used by JIT)
-    program_map: [4096 - memory_base]*anyopaque,
     /// Program size, used to trap self-modifying code
     program_size: u12,
 
@@ -189,7 +310,8 @@ const Env = struct {
     timer: std.time.Timer,
     out: std.fs.File.Writer,
 
-    pub const memory_base = 0x200;
+    pub const memory_base = 512;
+    pub const memory_len = 4096;
 
     inline fn addrOffset(addr: u16) error{InvalidAddress}!u12 {
         return std.math.cast(u12, addr) orelse error.InvalidAddress;
@@ -203,7 +325,9 @@ const Env = struct {
     pub inline fn setMem(env: *Env, addr: u16, values: []const u8) !void {
         const begin = try addrOffset(addr);
         const end = try addrOffset(addr + @as(u4, @intCast(values.len)));
-        @memcpy(env.memory[begin..end], values);
+        for (env.memory[begin..end], values) |*d, s| {
+            d.* = s;
+        }
     }
     pub inline fn setMemNoSelfModify(env: *Env, addr: u16, values: []const u8) !void {
         const begin = try addrOffset(addr);
@@ -214,7 +338,9 @@ const Env = struct {
             });
             return error.CodeSegmentModified;
         }
-        @memcpy(env.memory[begin..end], values);
+        for (env.memory[begin..end], values) |*d, s| {
+            d.* = s;
+        }
     }
 
     pub inline fn getReg(env: *Env, r: Register) u8 {
@@ -250,7 +376,10 @@ const Env = struct {
             text.appendAssumeCapacity('\n');
         }
 
-        try env.out.writeAll(text.slice());
+        env.out.writeAll(text.slice()) catch |err| {
+            std.log.err("IO error while blitting screen: {s}", .{@errorName(err)});
+            return error.InputOutput;
+        };
     }
 };
 
